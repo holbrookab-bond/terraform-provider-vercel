@@ -2,7 +2,9 @@ package vercel
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
+	"strings"
 
 	"github.com/hashicorp/terraform-plugin-framework-validators/setvalidator"
 	"github.com/hashicorp/terraform-plugin-framework-validators/stringvalidator"
@@ -111,6 +113,7 @@ At this time you cannot use a Vercel Project resource with in-line ` + "`environ
 				Required:    true,
 				Description: "The value of the Environment Variable.",
 				Sensitive:   true,
+				WriteOnly: true,
 			},
 			"git_branch": schema.StringAttribute{
 				Optional:    true,
@@ -174,6 +177,17 @@ func (r *projectEnvironmentVariableResource) ModifyPlan(ctx context.Context, req
 	resp.Diagnostics.Append(diags...)
 	if resp.Diagnostics.HasError() {
 		return
+	}
+
+    prefix := fmt.Sprintf("vercel_env_%s_%s_", config.ProjectID.ValueString(), config.TeamID.ValueString())
+	hash := sha256.Sum256([]byte(config.Value.ValueString()))
+    privateKey := prefix + config.Key.ValueString()
+    storedHash, _ := req.Private.GetKey(ctx, privateKey)
+
+    if len(storedHash) > 0 && strings.Trim(string(storedHash), "\"") == fmt.Sprintf("%x", hash) {
+	} else {
+		resp.RequiresReplace = append(resp.RequiresReplace,
+			path.Root("value"))
 	}
 
 	if config.ID.ValueString() != "" {
@@ -310,7 +324,7 @@ func convertResponseToProjectEnvironmentVariable(response client.EnvironmentVari
 // This is called automatically by the provider when a new resource should be created.
 func (r *projectEnvironmentVariableResource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
 	var plan ProjectEnvironmentVariable
-	diags := req.Plan.Get(ctx, &plan)
+	diags := req.Config.Get(ctx, &plan)
 	resp.Diagnostics.Append(diags...)
 	if resp.Diagnostics.HasError() {
 		return
@@ -340,6 +354,12 @@ func (r *projectEnvironmentVariableResource) Create(ctx context.Context, req res
 	}
 
 	result := convertResponseToProjectEnvironmentVariable(response, plan.ProjectID, plan.Value)
+
+	// Set the hash of the environment variable value in the private state.
+	prefix := fmt.Sprintf("vercel_env_%s_%s_", plan.ProjectID.ValueString(), plan.TeamID.ValueString())
+	hash := sha256.Sum256([]byte(plan.Value.ValueString()))
+	privateKey := prefix + plan.Key.ValueString()
+	resp.Private.SetKey(ctx, privateKey, []byte(fmt.Sprintf("\"%x\"", hash)))
 
 	tflog.Info(ctx, "created project environment variable", map[string]any{
 		"id":         result.ID.ValueString(),
@@ -405,11 +425,33 @@ func (r *projectEnvironmentVariableResource) Update(ctx context.Context, req res
 		return
 	}
 
-	request, diags := plan.toUpdateEnvironmentVariableRequest(ctx)
+	var config ProjectEnvironmentVariable
+	diags = req.Config.Get(ctx, &config)
+	resp.Diagnostics.Append(diags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	// Config contains value (but no ID), but plan contains ID (but no value).
+	updateVariable := &ProjectEnvironmentVariable{
+		Target: config.Target,
+		CustomEnvironmentIDs: config.CustomEnvironmentIDs,
+		GitBranch: config.GitBranch,
+		Key: config.Key,
+		Value: config.Value,
+		TeamID: config.TeamID,
+		ProjectID: config.ProjectID,
+		ID: plan.ID,
+		Sensitive: config.Sensitive,
+		Comment: config.Comment,
+	}
+
+	request, diags := updateVariable.toUpdateEnvironmentVariableRequest(ctx)
 	if diags.HasError() {
 		resp.Diagnostics.Append(diags...)
 		return
 	}
+
 	response, err := r.client.UpdateEnvironmentVariable(ctx, request)
 	if err != nil {
 		resp.Diagnostics.AddError(
@@ -458,6 +500,11 @@ func (r *projectEnvironmentVariableResource) Delete(ctx context.Context, req res
 		)
 		return
 	}
+
+	// Remove the hash of the environment variable value in the private state.
+	prefix := fmt.Sprintf("vercel_env_%s_%s_", state.ProjectID.ValueString(), state.TeamID.ValueString())
+	privateKey := prefix + state.Key.ValueString()
+	resp.Private.SetKey(ctx, privateKey, nil)
 
 	tflog.Info(ctx, "deleted project environment variable", map[string]any{
 		"id":         state.ID.ValueString(),
